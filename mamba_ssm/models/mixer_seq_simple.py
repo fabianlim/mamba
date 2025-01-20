@@ -70,11 +70,28 @@ def create_block(
         mlp_cls = partial(
             GatedMLP, hidden_features=d_intermediate, out_features=d_model, **factory_kwargs
         )
+
+    if True:
+        # hack in the MoE
+        from fms_acceleration_moe.utils.scattermoe import ScatterMoE, SCATTERMOE_SPEC_HAS_GATE
+        moe_cls = partial(
+            ScatterMoE,
+            hidden_size=d_model,
+            hidden_act='silu',
+            intermediate_size=int(8* d_model / 3),
+            num_experts=4,
+            has_bias=False,
+            mlp_arch=SCATTERMOE_SPEC_HAS_GATE,
+            top_k=2,
+            **factory_kwargs
+        )
+
     block = Block(
         d_model,
         mixer_cls,
         mlp_cls,
         norm_cls=norm_cls,
+        moe_cls=moe_cls,
         fused_add_norm=fused_add_norm,
         residual_in_fp32=residual_in_fp32,
     )
@@ -288,7 +305,10 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         config_data = load_config_hf(pretrained_model_name)
         config = MambaConfig(**config_data)
         model = cls(config, device=device, dtype=dtype, **kwargs)
-        model.load_state_dict(load_state_dict_hf(pretrained_model_name, device=device, dtype=dtype))
+        model.load_state_dict(
+            load_state_dict_hf(pretrained_model_name, device=device, dtype=dtype),
+            strict=False
+        )
         return model
 
     def save_pretrained(self, save_directory):
