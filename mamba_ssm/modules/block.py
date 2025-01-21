@@ -10,8 +10,7 @@ from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn
 class Block(nn.Module):
     def __init__(
         self, dim, mixer_cls, mlp_cls, 
-        moe_cls=None,
-        norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False
+        norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False,
     ):
         """
         Simple block wrapping a mixer class with LayerNorm/RMSNorm and residual connection"
@@ -35,11 +34,6 @@ class Block(nn.Module):
             self.mlp = mlp_cls(dim)
         else:
             self.mlp = None
-
-        # hack in the MoE
-        if moe_cls:
-            self.norm2 = norm_cls(dim)
-            self.moe = moe_cls()
 
         if self.fused_add_norm:
             assert RMSNorm is not None, "RMSNorm import fails"
@@ -74,7 +68,7 @@ class Block(nn.Module):
             )
         hidden_states = self.mixer(hidden_states, inference_params=inference_params, **mixer_kwargs)
 
-        if self.moe is not None:
+        if self.mlp is not None:
             if not self.fused_add_norm:
                 residual = hidden_states + residual
                 hidden_states = self.norm2(residual.to(dtype=self.norm2.weight.dtype))
@@ -91,7 +85,7 @@ class Block(nn.Module):
                     eps=self.norm2.eps,
                     is_rms_norm=isinstance(self.norm2, RMSNorm)
                 )
-            hidden_states, _ = self.moe(hidden_states)
+            hidden_states = self.mlp(hidden_states)
 
         return hidden_states, residual
 

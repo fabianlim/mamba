@@ -25,6 +25,17 @@ try:
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
+import warnings
+
+HAS_SCATTERMOE = False
+try:
+    from fms_acceleration_moe.utils.scattermoe import ScatterMoE, SCATTERMOE_SPEC_HAS_GATE
+    # breadcrumb
+    ScatterMoE._disable_load_balance_loss = False
+    HAS_SCATTERMOE = True
+except ImportError:
+    pass
+
 
 def create_block(
     d_model,
@@ -32,6 +43,7 @@ def create_block(
     ssm_cfg=None,
     attn_layer_idx=None,
     attn_cfg=None,
+    mlp_cfg=None,
     norm_epsilon=1e-5,
     rms_norm=False,
     residual_in_fp32=False,
@@ -46,6 +58,14 @@ def create_block(
         attn_layer_idx = []
     if attn_cfg is None:
         attn_cfg = {}
+    if mlp_cfg is None:
+        # TODO: hardcode
+        mlp_cfg = {}
+        # mlp_cfg = {
+        #     'n_expert': 4,
+        #     'load_balancing_loss': True,
+        # }
+
     factory_kwargs = {"device": device, "dtype": dtype}
     if layer_idx not in attn_layer_idx:
         # Create a copy of the config to modify
@@ -66,23 +86,39 @@ def create_block(
     )
     if d_intermediate == 0:
         mlp_cls = nn.Identity
-    else:
+    elif len(mlp_cfg) == 0:
         mlp_cls = partial(
             GatedMLP, hidden_features=d_intermediate, out_features=d_model, **factory_kwargs
         )
+    else:
+        assert HAS_SCATTERMOE, "MoE requires scattermoe"
 
-    if True:
-        # hack in the MoE
-        from fms_acceleration_moe.utils.scattermoe import ScatterMoE, SCATTERMOE_SPEC_HAS_GATE
-        moe_cls = partial(
+        if (
+            mlp_cfg.get('load_balancing_loss', False) == False and
+            ScatterMoE._disable_load_balance_loss == False
+        ):
+            # to handle the load balancing loss
+            _old_scattermoe_forward = ScatterMoE.forward
+            def _scattermoe_forward(self, hidden_states: torch.Tensor):
+                hidden_states, _ = _old_scattermoe_forward(self, hidden_states)
+                return hidden_states
+            ScatterMoE.forward = _scattermoe_forward
+            ScatterMoE._disable_load_balance_loss = True
+            warnings.warn(
+                "Disabled returning of router logits for ScatterMoE. "
+                "To renable requires reload of module."
+            )
+
+        mlp_cls = partial(
             ScatterMoE,
-            hidden_size=d_model,
+            # hidden_size=d_model,
             hidden_act='silu',
-            intermediate_size=int(8* d_model / 3),
-            num_experts=4,
-            has_bias=False,
-            mlp_arch=SCATTERMOE_SPEC_HAS_GATE,
-            top_k=2,
+            # intermediate_size=int(8* d_model / 3),
+            intermediate_size=d_intermediate,
+            num_experts=mlp_cfg['n_expert'],
+            has_bias=False, # hardcode this, scattermoe cannot work with bias
+            mlp_arch=SCATTERMOE_SPEC_HAS_GATE, # hardcode this, use gated
+            top_k=mlp_cfg.get('top_k', 2),
             **factory_kwargs
         )
 
@@ -91,7 +127,6 @@ def create_block(
         mixer_cls,
         mlp_cls,
         norm_cls=norm_cls,
-        moe_cls=moe_cls,
         fused_add_norm=fused_add_norm,
         residual_in_fp32=residual_in_fp32,
     )
@@ -142,6 +177,7 @@ class MixerModel(nn.Module):
         ssm_cfg=None,
         attn_layer_idx=None,
         attn_cfg=None,
+        mlp_cfg=None,
         norm_epsilon: float = 1e-5,
         rms_norm: bool = False,
         initializer_cfg=None,
@@ -179,6 +215,7 @@ class MixerModel(nn.Module):
                     residual_in_fp32=residual_in_fp32,
                     fused_add_norm=fused_add_norm,
                     layer_idx=i,
+                    mlp_cfg=mlp_cfg,
                     **factory_kwargs,
                 )
                 for i in range(n_layer)
@@ -207,10 +244,23 @@ class MixerModel(nn.Module):
     def forward(self, input_ids, inference_params=None, **mixer_kwargs):
         hidden_states = self.embedding(input_ids)
         residual = None
+        outputs = tuple()
         for layer in self.layers:
             hidden_states, residual = layer(
                 hidden_states, residual, inference_params=inference_params, **mixer_kwargs
             )
+            # if MoE
+            if isinstance(hidden_states, tuple):
+                # from transformers.models.granitemoe.modeling_granitemoe import load_balancing_loss_func
+                hidden_states, aux_outputs = hidden_states
+                # aux_loss = (
+                #     aux_loss + 
+                #     load_balancing_loss_func(
+                #         gate_logits
+                #     )
+                # )
+                outputs = outputs + (aux_outputs, )
+
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
@@ -226,6 +276,9 @@ class MixerModel(nn.Module):
                 residual_in_fp32=self.residual_in_fp32,
                 is_rms_norm=isinstance(self.norm_f, RMSNorm)
             )
+
+        if len(outputs) > 0:
+            return hidden_states, outputs
         return hidden_states
 
 
@@ -241,6 +294,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         self.config = config
         d_model = config.d_model
         n_layer = config.n_layer
+        mlp_cfg = config.mlp_cfg
         d_intermediate = config.d_intermediate
         vocab_size = config.vocab_size
         ssm_cfg = config.ssm_cfg
@@ -263,6 +317,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
             ssm_cfg=ssm_cfg,
             attn_layer_idx=attn_layer_idx,
             attn_cfg=attn_cfg,
+            mlp_cfg=mlp_cfg,
             rms_norm=rms_norm,
             initializer_cfg=initializer_cfg,
             fused_add_norm=fused_add_norm,
@@ -293,12 +348,17 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         "position_ids" is just to be compatible with Transformer generation. We don't use it.
         num_last_tokens: if > 0, only return the logits for the last n tokens
         """
+        aux_outputs = None
         hidden_states = self.backbone(input_ids, inference_params=inference_params, **mixer_kwargs)
+        if isinstance(hidden_states, tuple):
+            hidden_states, aux_outputs = hidden_states
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
         lm_logits = self.lm_head(hidden_states)
-        CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
-        return CausalLMOutput(logits=lm_logits)
+        CausalLMOutput = namedtuple(
+            "CausalLMOutput", ["logits", "aux_outputs"]
+        )
+        return CausalLMOutput(logits=lm_logits, aux_outputs=aux_outputs)
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name, device=None, dtype=None, **kwargs):
