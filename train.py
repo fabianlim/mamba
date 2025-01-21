@@ -27,6 +27,7 @@ def main(
     per_device_train_batch_size: int = 4,
     max_seq_length: int = 128,
     learning_rate: float = 1e-4,
+    print_itvl: int = 20,
 ):
 
     world_size = int(os.environ.get('WORLD_SIZE', 1))
@@ -43,17 +44,15 @@ def main(
     )
     model.train()
 
-    # for i, block in enumerate(model.backbone.layers):
-    #     from torch.distributed.algorithms._checkpoint import checkpoint_wrapper
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import apply_activation_checkpointing
     from mamba_ssm.modules.block import Block
     apply_activation_checkpointing(
         model, check_fn=lambda mod: isinstance(mod, Block)
     )
 
-
     device_mesh = None
     if world_size > 1:
+        # TODO: add device mesh to ScatterMoE
         device_mesh = init_device_mesh(
             device, 
             (world_size,), mesh_dim_names=('data_parallel', )
@@ -79,6 +78,10 @@ def main(
             ),
             device_id=rank,
         )
+    
+    if rank == 0:
+        # print for debug
+        print(model)
 
     # - create optimizer (after sharding)
     optimizer = AdamW(model.parameters(), lr=learning_rate)
@@ -116,10 +119,10 @@ def main(
         loss.backward()
         optimizer.step()
 
-        print ({"step": step+1, "loss": ave_loss})
+        if rank == 0 and (step % print_itvl) == 0:
+            print ({"step": step+1, "loss": ave_loss})
 
 
 if __name__ == '__main__':
-    # import fire
-    # fire.Fire(main)
-    main()
+    import fire
+    fire.Fire(main)

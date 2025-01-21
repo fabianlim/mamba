@@ -29,12 +29,15 @@ import warnings
 
 HAS_SCATTERMOE = False
 try:
+    if os.environ.get("DISABLE_SCATTERMOE", "False") == "True":
+        warnings.warn("DISABLE_SCATTERMOE=True so disabling ScatterMoE")
+        raise ImportError("Disabling ScatterMoE") 
     from fms_acceleration_moe.utils.scattermoe import ScatterMoE, ScatteredExperts, SCATTERMOE_SPEC_HAS_GATE
     # breadcrumb
     ScatterMoE._disable_load_balance_loss = False
     HAS_SCATTERMOE = True
 except ImportError:
-    pass
+    from transformers.models.granitemoe.modeling_granitemoe import GraniteMoeConfig, GraniteMoeMoE
 
 
 def create_block(
@@ -59,12 +62,7 @@ def create_block(
     if attn_cfg is None:
         attn_cfg = {}
     if mlp_cfg is None:
-        # TODO: hardcode
         mlp_cfg = {}
-        # mlp_cfg = {
-        #     'n_expert': 4,
-        #     'load_balancing_loss': True,
-        # }
 
     factory_kwargs = {"device": device, "dtype": dtype}
     if layer_idx not in attn_layer_idx:
@@ -91,36 +89,57 @@ def create_block(
             GatedMLP, hidden_features=d_intermediate, out_features=d_model, **factory_kwargs
         )
     else:
-        assert HAS_SCATTERMOE, "MoE requires scattermoe"
 
-        if (
-            mlp_cfg.get('load_balancing_loss', False) == False and
-            ScatterMoE._disable_load_balance_loss == False
-        ):
-            # to handle the load balancing loss
-            _old_scattermoe_forward = ScatterMoE.forward
-            def _scattermoe_forward(self, hidden_states: torch.Tensor):
-                hidden_states, _ = _old_scattermoe_forward(self, hidden_states)
-                return hidden_states
-            ScatterMoE.forward = _scattermoe_forward
-            ScatterMoE._disable_load_balance_loss = True
-            warnings.warn(
-                "Disabled returning of router logits for ScatterMoE. "
-                "To renable requires reload of module."
+        if HAS_SCATTERMOE:
+            if (
+                mlp_cfg.get('load_balancing_loss', False) == False and
+                ScatterMoE._disable_load_balance_loss == False
+            ):
+                # to handle the load balancing loss
+                _old_scattermoe_forward = ScatterMoE.forward
+                def _scattermoe_forward(self, hidden_states: torch.Tensor):
+                    hidden_states, _ = _old_scattermoe_forward(self, hidden_states)
+                    return hidden_states
+                ScatterMoE.forward = _scattermoe_forward
+                ScatterMoE._disable_load_balance_loss = True
+                warnings.warn(
+                    "Disabled returning of router logits for ScatterMoE. "
+                    "To renable requires reload of module."
+                )
+
+            mlp_cls = partial(
+                ScatterMoE,
+                # hidden_size=d_model,
+                hidden_act='silu',
+                # intermediate_size=int(8* d_model / 3),
+                intermediate_size=d_intermediate,
+                num_experts=mlp_cfg['n_expert'],
+                has_bias=False, # hardcode this, scattermoe cannot work with bias
+                mlp_arch=SCATTERMOE_SPEC_HAS_GATE, # hardcode this, use gated
+                top_k=mlp_cfg.get('top_k', 2),
+                **factory_kwargs
             )
+        else:
+            # NOTE: just for benching against a naive 
+            # MoE implementation, not to be used for
+            # real training
 
-        mlp_cls = partial(
-            ScatterMoE,
-            # hidden_size=d_model,
-            hidden_act='silu',
-            # intermediate_size=int(8* d_model / 3),
-            intermediate_size=d_intermediate,
-            num_experts=mlp_cfg['n_expert'],
-            has_bias=False, # hardcode this, scattermoe cannot work with bias
-            mlp_arch=SCATTERMOE_SPEC_HAS_GATE, # hardcode this, use gated
-            top_k=mlp_cfg.get('top_k', 2),
-            **factory_kwargs
-        )
+            def _build_granite_moe(dim):
+                config = GraniteMoeConfig(
+                    hidden_size=dim,
+                    intermediate_size=d_intermediate,
+                    hidden_act='silu',
+                    num_local_experts=mlp_cfg['n_expert'],
+                    num_experts_per_tok=mlp_cfg.get('top_k', 2),
+                    output_router_logits=mlp_cfg.get('load_balancing_loss', False)
+                )
+                mod = GraniteMoeMoE(config)
+                if 'dtype' in factory_kwargs:
+                    mod = mod.to(factory_kwargs['dtype'])
+                if 'device' in factory_kwargs:
+                    mod = mod.to(factory_kwargs['device'])
+                return mod
+            mlp_cls = _build_granite_moe
 
     block = Block(
         d_model,
@@ -253,14 +272,7 @@ class MixerModel(nn.Module):
             )
             # if MoE
             if isinstance(hidden_states, tuple):
-                # from transformers.models.granitemoe.modeling_granitemoe import load_balancing_loss_func
                 hidden_states, aux_outputs = hidden_states
-                # aux_loss = (
-                #     aux_loss + 
-                #     load_balancing_loss_func(
-                #         gate_logits
-                #     )
-                # )
                 outputs = outputs + (aux_outputs, )
 
         if not self.fused_add_norm:
