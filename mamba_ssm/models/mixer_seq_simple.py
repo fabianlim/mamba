@@ -29,7 +29,7 @@ import warnings
 
 HAS_SCATTERMOE = False
 try:
-    from fms_acceleration_moe.utils.scattermoe import ScatterMoE, SCATTERMOE_SPEC_HAS_GATE
+    from fms_acceleration_moe.utils.scattermoe import ScatterMoE, ScatteredExperts, SCATTERMOE_SPEC_HAS_GATE
     # breadcrumb
     ScatterMoE._disable_load_balance_loss = False
     HAS_SCATTERMOE = True
@@ -148,6 +148,8 @@ def _init_weights(
                 nn.init.zeros_(module.bias)
     elif isinstance(module, nn.Embedding):
         nn.init.normal_(module.weight, std=initializer_range)
+    elif HAS_SCATTERMOE and isinstance(module, ScatteredExperts):
+        nn.init.normal_(module.weight)
 
     if rescale_prenorm_residual:
         # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
