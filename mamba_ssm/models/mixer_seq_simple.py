@@ -138,7 +138,7 @@ def create_block(
 def _init_weights(
     module,
     n_layer,
-    initializer_range=0.02,  # Now only used for embedding layer.
+    initializer_range=0.02,  # Used for embedding layer and (scattermoe).
     rescale_prenorm_residual=True,
     n_residuals_per_layer=1,  # Change to 2 if we have MLP
 ):
@@ -149,7 +149,7 @@ def _init_weights(
     elif isinstance(module, nn.Embedding):
         nn.init.normal_(module.weight, std=initializer_range)
     elif HAS_SCATTERMOE and isinstance(module, ScatteredExperts):
-        nn.init.normal_(module.weight)
+        nn.init.normal_(module.weight, std=initializer_range)
 
     if rescale_prenorm_residual:
         # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
