@@ -247,14 +247,15 @@ class MixerModel(nn.Module):
             d_model, eps=norm_epsilon, **factory_kwargs
         )
 
-        self.apply(
-            partial(
-                _init_weights,
-                n_layer=n_layer,
-                **(initializer_cfg if initializer_cfg is not None else {}),
-                n_residuals_per_layer=1 if d_intermediate == 0 else 2,  # 2 if we have MLP
+        if initializer_cfg:
+            self.apply(
+                partial(
+                    _init_weights,
+                    n_layer=n_layer,
+                    **(initializer_cfg if initializer_cfg is not None else {}),
+                    n_residuals_per_layer=1 if d_intermediate == 0 else 2,  # 2 if we have MLP
+                )
             )
-        )
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return {
@@ -341,13 +342,14 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)
 
         # Initialize weights and apply final processing
-        self.apply(
-            partial(
-                _init_weights,
-                n_layer=n_layer,
-                **(initializer_cfg if initializer_cfg is not None else {}),
+        if initializer_cfg:
+            self.apply(
+                partial(
+                    _init_weights,
+                    n_layer=n_layer,
+                    **(initializer_cfg if initializer_cfg is not None else {}),
+                )
             )
-        )
         self.tie_weights()
 
     def tie_weights(self):
@@ -378,11 +380,16 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
     def from_pretrained(cls, pretrained_model_name, device=None, dtype=None, **kwargs):
         config_data = load_config_hf(pretrained_model_name)
         config = MambaConfig(**config_data)
+        low_cpu_mem_mode = kwargs.pop("low_cpu_mem_mode", False)
         model = cls(config, device=device, dtype=dtype, **kwargs)
-        model.load_state_dict(
-            load_state_dict_hf(pretrained_model_name, device=device, dtype=dtype),
-            strict=False
-        )
+
+        # when using low_cpu_mem_mode, try to set to True to avoid
+        # loading the state dict if the model is on meta device
+        if not low_cpu_mem_mode:
+            model.load_state_dict(
+                load_state_dict_hf(pretrained_model_name, device=device, dtype=dtype),
+                strict=False
+            )
         return model
 
     def save_pretrained(self, save_directory):

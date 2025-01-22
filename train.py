@@ -28,6 +28,7 @@ def main(
     max_seq_length: int = 128,
     learning_rate: float = 1e-4,
     print_itvl: int = 20,
+    low_cpu_mem_mode: bool = False,
 ):
 
     world_size = int(os.environ.get('WORLD_SIZE', 1))
@@ -37,11 +38,26 @@ def main(
         torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
         torch.cuda.set_device(rank)
 
-    model = MambaLMHeadModel.from_pretrained(
-        model_name,
-        device=device,
-        dtype=getattr(torch, dtype)
-    )
+
+    from accelerate.big_modeling import init_empty_weights, init_on_device
+
+    if not low_cpu_mem_mode:
+        # from contextlib import nullcontext
+        loading_context = partial(init_on_device, device=device)
+    elif rank == 0:
+        loading_context = partial(init_on_device, device='cpu')
+    else:
+        loading_context = partial(init_empty_weights, include_buffers=False)
+
+    with loading_context():
+        # TODO: weight initialization not done properly
+        # need to pass in initializer_cfg to init the weights
+        model = MambaLMHeadModel.from_pretrained(
+            model_name,
+            dtype=getattr(torch, dtype),
+            low_cpu_mem_mode=rank > 0 and low_cpu_mem_mode,
+        )
+
     model.train()
 
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import apply_activation_checkpointing
@@ -64,12 +80,23 @@ def main(
             if str(param.dtype) != f"torch.{dtype}":
                 param.data = param.data.to(getattr(torch, dtype))
 
+        # somehow the buffers in RotaryEmb causing alot of problems
+        # - so we need to ignore them in FSDP
+        # - also we delete the buffers and just attach them as tensors and 
+        #  move them to device manually
+        for name, mod in model.named_modules():
+            if 'rotary_emb' in name:
+                inv_freq = mod._buffers['inv_freq']
+                del mod._buffers['inv_freq']
+                mod.inv_freq = inv_freq.to(device)
+
+        from accelerate.utils.fsdp_utils import ensure_weights_retied
+
         # lazy to use FSDP2, use FSDP1 for now
         model = FSDP(
             model,
             sharding_strategy=ShardingStrategy.FULL_SHARD,
             backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-            ignored_modules=None,
             use_orig_params=False,
             forward_prefetch=False,
             auto_wrap_policy=partial(
@@ -77,11 +104,26 @@ def main(
                 transformer_layer_cls={Block},
             ),
             device_id=rank,
+            sync_module_states=True,
+            param_init_fn=(
+                None if rank == 0 else ensure_weights_retied(
+                    lambda x: x.to_empty(device=device), 
+                    model,
+                    device
+                )
+            ),
+            ignored_modules=[
+                p for name, p in model.named_modules()
+                if 'rotary_emb' in name
+            ]
         )
-    
+
     if rank == 0:
         # print for debug
         print(model)
+        print ("Number parameters per device: ", sum([p.numel() for p in model.parameters()]))
+        torch.cuda.empty_cache()
+        print ("Memory after model loading", torch.cuda.memory_allocated())
 
     # - create optimizer (after sharding)
     optimizer = AdamW(model.parameters(), lr=learning_rate)
@@ -98,10 +140,13 @@ def main(
     for step in trange(total_train_steps, disable=rank>0):
         optimizer.zero_grad()
         out = model(input_ids)
+
+        if rank == 0 and step == 0:
+            print ("Memory after model forward", torch.cuda.memory_allocated())
+
         loss = ForCausalLMLoss(
             out.logits, labels, out.logits.shape[-1]
         )
-
 
         if out.aux_outputs is not None:
             aux_loss = load_balancing_loss_func(
@@ -117,6 +162,8 @@ def main(
         )
 
         loss.backward()
+        if rank == 0 and step == 0:
+            print ("Memory after model backward", torch.cuda.memory_allocated())
         optimizer.step()
 
         if rank == 0 and (step % print_itvl) == 0:
