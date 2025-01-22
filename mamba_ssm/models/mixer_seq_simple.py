@@ -379,7 +379,8 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
     @classmethod
     def from_pretrained(cls, pretrained_model_name, device=None, dtype=None, **kwargs):
         config_data = load_config_hf(pretrained_model_name)
-        config = MambaConfig(**config_data)
+        config_kwargs = kwargs.pop("config_kwargs", {})
+        config = MambaConfig(**config_data, **config_kwargs)
         low_cpu_mem_mode = kwargs.pop("low_cpu_mem_mode", False)
         model = cls(config, device=device, dtype=dtype, **kwargs)
 

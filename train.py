@@ -10,6 +10,7 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import (
     ShardingStrategy,
     BackwardPrefetch
 )
+import time
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.optim import AdamW
 from functools import partial
@@ -29,6 +30,9 @@ def main(
     learning_rate: float = 1e-4,
     print_itvl: int = 20,
     low_cpu_mem_mode: bool = False,
+    n_expert: int = 2,
+    freeze_data: bool = True,
+    warmup_steps: int = 10,
 ):
 
     world_size = int(os.environ.get('WORLD_SIZE', 1))
@@ -52,10 +56,18 @@ def main(
     with loading_context():
         # TODO: weight initialization not done properly
         # need to pass in initializer_cfg to init the weights
+
+        # config_kwargs will be passed to config
         model = MambaLMHeadModel.from_pretrained(
             model_name,
             dtype=getattr(torch, dtype),
             low_cpu_mem_mode=rank > 0 and low_cpu_mem_mode,
+            config_kwargs={
+                "mlp_cfg": {
+                    "n_expert": n_expert,
+                    "load_balancing_loss": True
+                }
+            }
         )
 
     model.train()
@@ -118,42 +130,72 @@ def main(
             ]
         )
 
+    stats = {}
     if rank == 0:
         # print for debug
         print(model)
-        print ("Number parameters per device: ", sum([p.numel() for p in model.parameters()]))
+        # print ("Number parameters per device: ", sum([p.numel() for p in model.parameters()]))
+        stats['num_parameters'] = sum([p.numel() for p in model.parameters()])
         torch.cuda.empty_cache()
-        print ("Memory after model loading", torch.cuda.memory_allocated())
+        stats['memory_after_model_load'] = torch.cuda.memory_allocated()
+        # print ("Memory after model loading", torch.cuda.memory_allocated())
 
     # - create optimizer (after sharding)
     optimizer = AdamW(model.parameters(), lr=learning_rate)
 
-    # some easy to debug dummy data
-    input_ids = torch.ones(
-        (per_device_train_batch_size, max_seq_length), 
-        dtype=torch.long, 
-        device=device,
-    )
-    labels = input_ids
+    def generate_data(static: bool = False):
+
+        func = (
+            partial(torch.randint, high=model.config.vocab_size)
+            if not static else torch.ones
+        )
+        # some easy to debug dummy data
+        input_ids = func(
+            size=(per_device_train_batch_size, max_seq_length), 
+            dtype=torch.long, 
+            device=device,
+        )
+        labels = input_ids
+        return input_ids, labels
+
+    assert warmup_steps < total_train_steps
 
     ave_loss = 0.
     for step in trange(total_train_steps, disable=rank>0):
+
+        if (
+            (freeze_data and step==0) or not freeze_data
+        ):
+            input_ids, labels = generate_data()
+
+        if rank == 0 and step == warmup_steps:
+            t1 = time.time()
+
         optimizer.zero_grad()
         out = model(input_ids)
 
         if rank == 0 and step == 0:
-            print ("Memory after model forward", torch.cuda.memory_allocated())
+            # print ("Memory after model forward", torch.cuda.memory_allocated())
+            stats['memory_after_model_forward'] = torch.cuda.memory_allocated()
 
         loss = ForCausalLMLoss(
             out.logits, labels, out.logits.shape[-1]
         )
 
+        distribution = None
         if out.aux_outputs is not None:
+            top_k = model.config.mlp_cfg.get('top_k',2)
             aux_loss = load_balancing_loss_func(
                 out.aux_outputs, 
                 num_experts=model.config.mlp_cfg['n_expert'],
-                top_k=model.config.mlp_cfg.get('top_k',2)
+                top_k=top_k,
             )
+
+            # just do on the top
+            _, distribution = out.aux_outputs[0].topk(
+                top_k
+            ).indices.unique(return_counts=True)
+            distribution = distribution.detach().cpu().tolist()
 
             loss += 0.2 * aux_loss
 
@@ -163,12 +205,20 @@ def main(
 
         loss.backward()
         if rank == 0 and step == 0:
-            print ("Memory after model backward", torch.cuda.memory_allocated())
+            # print ("Memory after model backward", torch.cuda.memory_allocated())
+            stats['memory_after_model_backward'] = torch.cuda.memory_allocated()
+
         optimizer.step()
 
         if rank == 0 and (step % print_itvl) == 0:
-            print ({"step": step+1, "loss": ave_loss})
+            print ({"step": step+1, "loss": ave_loss, "distribution": distribution})
 
+    torch.cuda.synchronize()
+
+    if rank == 0:
+        t1 = time.time() - t1
+        stats['time_taken'] = t1
+        print (stats)
 
 if __name__ == '__main__':
     import fire
