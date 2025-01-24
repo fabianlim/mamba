@@ -247,15 +247,14 @@ class MixerModel(nn.Module):
             d_model, eps=norm_epsilon, **factory_kwargs
         )
 
-        if initializer_cfg:
-            self.apply(
-                partial(
-                    _init_weights,
-                    n_layer=n_layer,
-                    **(initializer_cfg if initializer_cfg is not None else {}),
-                    n_residuals_per_layer=1 if d_intermediate == 0 else 2,  # 2 if we have MLP
-                )
+        self.apply(
+            partial(
+                _init_weights,
+                n_layer=n_layer,
+                **(initializer_cfg if initializer_cfg is not None else {}),
+                n_residuals_per_layer=1 if d_intermediate == 0 else 2,  # 2 if we have MLP
             )
+        )
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return {
@@ -342,14 +341,13 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)
 
         # Initialize weights and apply final processing
-        if initializer_cfg:
-            self.apply(
-                partial(
-                    _init_weights,
-                    n_layer=n_layer,
-                    **(initializer_cfg if initializer_cfg is not None else {}),
-                )
+        self.apply(
+            partial(
+                _init_weights,
+                n_layer=n_layer,
+                **(initializer_cfg if initializer_cfg is not None else {}),
             )
+        )
         self.tie_weights()
 
     def tie_weights(self):
