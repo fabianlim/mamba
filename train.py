@@ -2,7 +2,7 @@ import os
 import torch
 from tqdm import trange
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel, MambaConfig
-from torch.distributed.tensor import init_device_mesh
+from torch.distributed.tensor import init_device_mesh, DeviceMesh
 from transformers.loss.loss_utils import ForCausalLMLoss
 from transformers.models.granitemoe.modeling_granitemoe import load_balancing_loss_func
 from torch.distributed.fsdp.fully_sharded_data_parallel import (
@@ -14,6 +14,57 @@ import time
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.optim import AdamW
 from functools import partial
+
+from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
+from collections import OrderedDict
+
+# taken from fms_acceleration_moe.utils.scattermoe_prepare.load_experts_onto_device
+def shard_scattermoe(
+    module: torch.nn.Module,
+    state_dict: OrderedDict,
+    device_mesh: DeviceMesh,
+    key_ep: str,
+    router_name: str = 'router',
+):
+    # hook for scaling the gradient
+    scaling = device_mesh[key_ep].size()
+
+    def _hook(grad):
+        if grad is not None:
+            grad.div_(scaling)
+        return grad
+
+    # required replication placements
+    reps = [Replicate() for _ in range(device_mesh.ndim - 1)]
+
+    for weight_name, param in state_dict.items():
+
+        if router_name in weight_name:
+            # if its the router, replicate
+            param = distribute_tensor(param, device_mesh, reps + [Replicate()])
+        else:
+            # if its a weight and the already sharded by number of experts
+            param = DTensor.from_local(
+                param, device_mesh=device_mesh, placements=reps + [Shard(0)]
+            )
+
+        # get the module we want to shard
+        name = weight_name.split(".")
+        path, name = ".".join(name[:-1]), name[-1]
+        mod = module.get_submodule(path)
+        requires_grad = getattr(mod, name).requires_grad
+
+        param = torch.nn.Parameter(
+            param,
+            requires_grad=requires_grad,
+        )
+
+        # install gradient scaling hook
+        if router_name not in weight_name:
+            param.register_hook(_hook)
+
+        # register the sharded parameter 
+        mod.register_parameter(name, param)
 
 # hack in a section in the config
 # "mlp_cfg": {
@@ -31,6 +82,7 @@ def main(
     print_itvl: int = 20,
     low_cpu_mem_mode: bool = False,
     n_expert: int = 2,
+    ep_degree: int = 1,
     freeze_data: bool = True,
     warmup_steps: int = 10,
 ):
@@ -42,6 +94,20 @@ def main(
         torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
         torch.cuda.set_device(rank)
 
+    # for the expert parallel
+    device_mesh = None
+    if world_size > 1 and ep_degree > 1:
+        # needed to shard
+        assert world_size % ep_degree == 0
+
+        # needed
+        assert n_expert % ep_degree == 0
+
+        device_mesh = init_device_mesh(
+            device, 
+            (world_size // ep_degree, ep_degree), 
+            mesh_dim_names=('data_parallel', 'expert_parallel')
+        )
 
     from accelerate.big_modeling import init_empty_weights, init_on_device
 
@@ -58,6 +124,8 @@ def main(
         # need to pass in initializer_cfg to init the weights
 
         # config_kwargs will be passed to config
+        # - device_mesh to be passed into MambaLMHeadModel's
+        #   constructor (to be used to load ScatterMoE)
         model = MambaLMHeadModel.from_pretrained(
             model_name,
             dtype=getattr(torch, dtype),
@@ -67,7 +135,8 @@ def main(
                     "n_expert": n_expert,
                     "load_balancing_loss": True
                 }
-            }
+            },
+            device_mesh=device_mesh['expert_parallel'],
         )
 
     model.train()
@@ -78,13 +147,68 @@ def main(
         model, check_fn=lambda mod: isinstance(mod, Block)
     )
 
-    device_mesh = None
     if world_size > 1:
-        # TODO: add device mesh to ScatterMoE
-        device_mesh = init_device_mesh(
-            device, 
-            (world_size,), mesh_dim_names=('data_parallel', )
-        )
+
+        # handle the scattermoe first
+        ignored_modules = []
+        if ep_degree > 1:
+            num_experts_per_degree = n_expert // ep_degree
+            idxs = list(
+                range(
+                    rank*num_experts_per_degree,  
+                    (rank+1)*num_experts_per_degree,  
+                )
+            )
+            for layer in model.backbone.layers:
+
+                mod = layer.mlp
+
+                # we need to manually shard the params
+                # NOTE: in the ep case, the linear router
+                # is sharded when it should not, so we recreate
+                # it
+                mod.router = torch.nn.Linear(
+                    in_features=mod.router.in_features,
+                    out_features=n_expert,
+                    bias=mod.router.bias is not None,
+                    device=mod.router.weight.device,
+                    dtype=mod.router.weight.dtype
+                )
+
+                # handle the state dict
+                sd = {
+                    name: (
+                        param
+                        if 'router' in name 
+                        else param[idxs]
+                    )
+                    for name, param in mod.named_parameters()
+                }
+
+                if low_cpu_mem_mode and rank > 0:
+                    # in this case, the router will be replicated
+                    # but the scattered experts need to be re-initialized
+                    # 
+                    for name in sd:
+                        param = sd[name]
+                        if 'router' in name:
+                            sd[name] = torch.empty_like(param, device='cpu')
+                        else:
+                            # NOTE: this is duplicated from _init_weights
+                            torch.nn.init.normal_(param, std=0.02)
+
+                # this will be the scattermoe
+                shard_scattermoe(
+                    mod, 
+                    sd,
+                    device_mesh,
+                    key_ep='expert_parallel',
+                    router_name='router',
+                )
+
+                # if there is EP, then the 
+                # the scattermoe will not be handled by FSDP
+                ignored_modules.append(mod)
 
         # mamba_ssm will keep D params in float32, which will cause 
         # problems
@@ -127,7 +251,7 @@ def main(
             ignored_modules=[
                 p for name, p in model.named_modules()
                 if 'rotary_emb' in name
-            ]
+            ] + ignored_modules
         )
 
     stats = {}
@@ -141,7 +265,13 @@ def main(
         # print ("Memory after model loading", torch.cuda.memory_allocated())
 
     # - create optimizer (after sharding)
-    optimizer = AdamW(model.parameters(), lr=learning_rate)
+    # NOTE: for ep we are mixing dtensors with shardedtensors (from FSDP 1)
+    # so we need to disable foreach
+    optimizer = AdamW(
+        model.parameters(), 
+        lr=learning_rate,
+        foreach=False if ep_degree > 1 else None,
+    )
 
     def generate_data(static: bool = False):
 

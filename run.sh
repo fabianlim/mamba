@@ -4,6 +4,7 @@ run() {
 
     local DISABLE_SCATTERMOE=${1:-"False"}
     local N_EXPERT=${2:-2}
+    local EP_DEGREE=${3:-1}
     
     DISABLE_SCATTERMOE=$DISABLE_SCATTERMOE \
     torchrun --nnodes=1 --node_rank=0 \
@@ -14,6 +15,7 @@ run() {
         --per_device_train_batch_size 8 \
         --low_cpu_mem_mode true \
         --n_expert $N_EXPERT \
+        --ep_degree $EP_DEGREE \
         --max_seq_length 128
 }
 
@@ -21,10 +23,9 @@ LOG_DIR=exprs
 
 mkdir -p $LOG_DIR
 
-TAG="kernels"
-for disable in "False" "True" ; do
-    for ne in 2 4 8 ; do
-        NAME=$LOG_DIR/${TAG}_${disable}_${ne}
-        run $disable $ne 1> $NAME.log 2> $NAME.err
-    done
+
+TAG="expert_parallel"
+for ne in 2 4 8 ; do
+    NAME=$LOG_DIR/${TAG}_${ne}_${ne}
+    run False $ne $ne 1> $NAME.log 2> $NAME.err
 done
