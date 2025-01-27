@@ -53,6 +53,7 @@ def create_block(
     fused_add_norm=False,
     layer_idx=None,
     device=None,
+    device_mesh=None,
     dtype=None,
 ):
     if ssm_cfg is None:
@@ -107,19 +108,34 @@ def create_block(
                     "To renable requires reload of module."
                 )
 
+            # NOTE: in the case where expert parallel is > 1
+            # i.e., when device_mesh.size() > 1 this is slighly incorrect
+            # logic, because this causes the router to be sharded,
+            # which is wrong because it has to function for the 
+            # global number of routers
+
+            num_experts_per_device = (
+                mlp_cfg['n_expert'] if device_mesh is None
+                else
+                mlp_cfg['n_expert'] // device_mesh.size()
+            )
+
             mlp_cls = partial(
                 ScatterMoE,
                 # hidden_size=d_model,
                 hidden_act='silu',
                 # intermediate_size=int(8* d_model / 3),
                 intermediate_size=d_intermediate,
-                num_experts=mlp_cfg['n_expert'],
+                num_experts=num_experts_per_device,
                 has_bias=False, # hardcode this, scattermoe cannot work with bias
                 mlp_arch=SCATTERMOE_SPEC_HAS_GATE, # hardcode this, use gated
                 top_k=mlp_cfg.get('top_k', 2),
-                **factory_kwargs
+                **factory_kwargs,
+                ep_device_mesh=device_mesh,
             )
         else:
+            assert device_mesh is None, "expert parallel requires ScatterMoe"
+
             # NOTE: just for benching against a naive 
             # MoE implementation, not to be used for
             # real training
@@ -205,6 +221,7 @@ class MixerModel(nn.Module):
         fused_add_norm=False,
         residual_in_fp32=False,
         device=None,
+        device_mesh=None,
         dtype=None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -237,6 +254,7 @@ class MixerModel(nn.Module):
                     fused_add_norm=fused_add_norm,
                     layer_idx=i,
                     mlp_cfg=mlp_cfg,
+                    device_mesh=device_mesh,
                     **factory_kwargs,
                 )
                 for i in range(n_layer)
@@ -247,14 +265,14 @@ class MixerModel(nn.Module):
             d_model, eps=norm_epsilon, **factory_kwargs
         )
 
-        self.apply(
-            partial(
-                _init_weights,
-                n_layer=n_layer,
-                **(initializer_cfg if initializer_cfg is not None else {}),
-                n_residuals_per_layer=1 if d_intermediate == 0 else 2,  # 2 if we have MLP
-            )
-        )
+        # self.apply(
+        #     partial(
+        #         _init_weights,
+        #         n_layer=n_layer,
+        #         **(initializer_cfg if initializer_cfg is not None else {}),
+        #         n_residuals_per_layer=1 if d_intermediate == 0 else 2,  # 2 if we have MLP
+        #     )
+        # )
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return {
@@ -303,6 +321,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         config: MambaConfig,
         initializer_cfg=None,
         device=None,
+        device_mesh=None,
         dtype=None,
     ) -> None:
         self.config = config
@@ -336,18 +355,19 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
             initializer_cfg=initializer_cfg,
             fused_add_norm=fused_add_norm,
             residual_in_fp32=residual_in_fp32,
+            device_mesh=device_mesh,
             **factory_kwargs,
         )
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)
 
         # Initialize weights and apply final processing
-        self.apply(
-            partial(
-                _init_weights,
-                n_layer=n_layer,
-                **(initializer_cfg if initializer_cfg is not None else {}),
-            )
-        )
+        # self.apply(
+        #     partial(
+        #         _init_weights,
+        #         n_layer=n_layer,
+        #         **(initializer_cfg if initializer_cfg is not None else {}),
+        #     )
+        # )
         self.tie_weights()
 
     def tie_weights(self):
