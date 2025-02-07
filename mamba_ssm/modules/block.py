@@ -9,7 +9,8 @@ from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn
 
 class Block(nn.Module):
     def __init__(
-        self, dim, mixer_cls, mlp_cls, norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False
+        self, dim, mixer_cls, mlp_cls, 
+        norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False,
     ):
         """
         Simple block wrapping a mixer class with LayerNorm/RMSNorm and residual connection"
@@ -33,6 +34,7 @@ class Block(nn.Module):
             self.mlp = mlp_cls(dim)
         else:
             self.mlp = None
+
         if self.fused_add_norm:
             assert RMSNorm is not None, "RMSNorm import fails"
             assert isinstance(
